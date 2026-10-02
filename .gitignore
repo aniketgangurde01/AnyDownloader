@@ -21,3 +21,4 @@ downloads/
 .DS_Store
 Thumbs.db
 *.log
+cloudflared.exe
