@@ -6,9 +6,10 @@ import math
 import shutil
 import asyncio
 import threading
+import re
 from typing import Optional, Dict, Any, List
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -47,6 +48,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    err_str = str(exc)
+    print(f"[ERROR] Global exception caught: {err_str}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Server Processing Error",
+            "message": f"Unable to process request: {err_str}",
+            "type": type(exc).__name__
+        }
+    )
 
 # In-memory download jobs
 jobs: Dict[str, Dict[str, Any]] = {}
@@ -490,8 +504,20 @@ def run_download_thread(job_id: str, payload: DownloadRequest):
                 job["error"] = "Download finished but file could not be located."
 
     except Exception as e:
+        err_str = str(e)
         job["status"] = "error"
-        job["error"] = str(e)
+        if "Sign in" in err_str or "login" in err_str.lower():
+            job["error"] = "This media is private or requires authentication to access."
+        elif "DRM" in err_str.upper():
+            job["error"] = "This media is protected by DRM encryption and cannot be downloaded."
+        elif "429" in err_str or "rate limit" in err_str.lower():
+            job["error"] = "Rate limit reached on source platform. Please wait a moment and try again."
+        elif "Video unavailable" in err_str or "404" in err_str:
+            job["error"] = "This video is unavailable, deleted, or region-restricted."
+        elif "Unsupported URL" in err_str:
+            job["error"] = "This URL format is not supported for media extraction."
+        else:
+            job["error"] = f"Download failed: {err_str[:250]}"
 
 @app.post("/api/download/start")
 async def start_download(payload: DownloadRequest):
@@ -532,23 +558,42 @@ async def get_download_status(job_id: str):
     }
 
 @app.get("/api/download/file/{job_id}")
-async def download_file(job_id: str):
+async def download_file(job_id: str, background_tasks: BackgroundTasks):
     if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job expired or not found.")
+        raise HTTPException(status_code=404, detail="Download session expired or not found.")
     job = jobs[job_id]
+    
+    if job.get("status") == "error":
+        raise HTTPException(status_code=400, detail=job.get("error", "Download process failed."))
+
     file_path = job.get("file_path")
     if not file_path or not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File is not available.")
+        raise HTTPException(status_code=404, detail="File is not available or has expired.")
     
     clean_filename = os.path.basename(file_path)
     if clean_filename.startswith(job_id + "_"):
         clean_filename = clean_filename[len(job_id) + 1:]
 
+    # 1. ASCII fallback for legacy HTTP latin-1 headers (prevents UnicodeEncodeError on emojis, fullwidth symbols, Hindi, etc.)
+    ascii_fallback = re.sub(r"[^\w\.-]", "_", clean_filename) or f"{job_id}.mp4"
+    # 2. RFC 5987 / RFC 6266 UTF-8 encoded filename for modern browsers
+    encoded_filename = quote(clean_filename, encoding="utf-8")
+
+    # Background cleanup of temporary file after stream delivery
+    def remove_temp_file():
+        time.sleep(20)  # Grace period for stream delivery
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
+
+    background_tasks.add_task(remove_temp_file)
+
     return FileResponse(
         path=file_path,
-        filename=clean_filename,
         media_type="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{clean_filename}"'}
+        headers={"Content-Disposition": f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded_filename}'}
     )
 
 @app.get("/api/supported-platforms")
